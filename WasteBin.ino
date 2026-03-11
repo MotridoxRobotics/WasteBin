@@ -3,7 +3,7 @@
 #include <ArduinoJson.h>
 
 /* =====================================================================
- * WESTO Smart Waste Bin — ESP32 Firmware v2.0.0
+ * WESTO Smart Waste Bin — ESP32 Firmware v2.1.0
  * =====================================================================
  * Hardware:
  *   - ESP32 DevKit
@@ -12,18 +12,24 @@
  *   - 1x Servo Motor (lid)
  *
  * Libraries needed (install via Arduino Library Manager):
- *   - ArduinoJson (by Benoit Blanchon)
+ *   - ArduinoJson 6.x (by Benoit Blanchon)
  *   - WiFi, WebServer (built into ESP32 Arduino core)
  *
  * Compatible with: ESP32 Arduino Core 2.x
- *   If using Core 3.x, replace ledcSetup/ledcAttachPin with ledcAttach()
+ *   If using Core 3.x, replace ledcSetup()+ledcAttachPin() with
+ *   ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_BITS) in setup().
  *
- * REST API (unchanged — compatible with Westo Flutter app):
+ * REST API (backward-compatible with Westo Flutter app):
  *   GET  /status       → waste level, compressor state, connectivity
  *   POST /compress     → trigger compression cycle
  *   GET  /update?level → manual waste level override (dashboard)
  *   GET  /device/info  → firmware version, MAC, IP
  *   GET  /             → web dashboard
+ *
+ * Changelog:
+ *   v1.1.0 — Original (Irfan): WiFi AP, dashboard, LED blink on compress
+ *   v2.0.0 — Jarvis: Full hardware control, state machine, sensors, servo
+ *   v2.1.0 — Jarvis: Stall debounce, proximity debounce, timeout fix
  * ===================================================================== */
 
 /* =========================== PIN CONFIG ==============================
@@ -50,7 +56,7 @@
 // Stepper Motor 2 (A4988: STEP, DIR, SLEEP)
 #define STEPPER2_STEP    32
 #define STEPPER2_DIR     33
-#define STEPPER2_SLP     14
+#define STEPPER2_SLP     14    // NOTE: GPIO14 may pulse HIGH briefly at boot
 
 // Built-in LED (status indicator)
 #define LED_PIN          2
@@ -78,6 +84,7 @@
 // --- Proximity / Lid ---
 #define PROXIMITY_CM         20.0f    // Open lid when person is within this distance
 #define PROXIMITY_CHECK_MS   200UL    // How often to check front sensor (ms)
+#define PROX_DEBOUNCE        2        // Require N consecutive reads to open lid
 #define LID_OPEN_ANGLE       80       // Servo angle for open lid (degrees, 75-85 range)
 #define LID_CLOSED_ANGLE     0        // Servo angle for closed lid
 #define LID_HOLD_OPEN_MS     3000UL   // Keep lid open this long after person leaves
@@ -87,9 +94,10 @@
 #define COMPRESS_TIMEOUT_MS  120000UL // Safety: abort if cycle exceeds 2 minutes
 #define STALL_CHECK_MS       5000UL   // Check for stall every 5 seconds
 #define STALL_THRESHOLD_CM   1.0f     // Plate moved < this in stall period → stalled
+#define STALL_CONFIRM        2        // Require N consecutive stall checks to confirm
 #define STEP_INTERVAL_US     3000UL   // Microseconds between step pulses (~100 RPM at 200 spr)
 
-// --- Stepper direction (swap if plate moves the wrong way) ---
+// --- Stepper direction (swap HIGH/LOW if plate moves the wrong way) ---
 #define DIR_DOWN             HIGH     // A4988 DIR pin state to move plate DOWN
 #define DIR_UP               LOW      // A4988 DIR pin state to move plate UP
 
@@ -130,6 +138,7 @@ unsigned long compStartMs       = 0;      // When current cycle started
 unsigned long lastStepUs        = 0;      // Last stepper pulse (micros)
 unsigned long lastStallCheckMs  = 0;      // Last stall-check timestamp
 float         lastStallDist     = 0;      // Distance at last stall check
+int           stallCount        = 0;      // Consecutive stall detections
 unsigned long lastCompressMs    = 0;      // When last cycle completed (for auto timer)
 unsigned long lastSensorReadMs  = 0;      // Top sensor read timer
 float         topDist           = 0;      // Latest top sensor reading (cm)
@@ -138,6 +147,7 @@ float         topDist           = 0;      // Latest top sensor reading (cm)
 bool          lidOpen           = false;
 unsigned long lidLastSeenMs     = 0;      // Last time person was detected
 unsigned long lastProxCheckMs   = 0;
+int           proxCount         = 0;      // Consecutive proximity detections
 
 /* ========================= SYSTEM DATA ============================== */
 int           wasteLevel            = 0;        // 0-100 %
@@ -150,7 +160,7 @@ bool          ledState    = false;
 unsigned long lastBlinkMs = 0;
 
 /* =====================================================================
- * ULTRASONIC: Read distance in cm (returns -1 on timeout)
+ * ULTRASONIC: Read distance in cm (returns -1 on timeout/error)
  * ===================================================================== */
 float readUltrasonic(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
@@ -222,6 +232,7 @@ void startCompression() {
   Serial.println("[COMP] === Starting compression cycle ===");
   compState   = COMP_DOWN;
   compStartMs = millis();
+  stallCount  = 0;
 
   enableSteppers();
   setStepDir(true);  // DOWN
@@ -231,6 +242,19 @@ void startCompression() {
   lastStallDist    = (d > 0) ? d : topDist;
   lastStallCheckMs = millis();
   lastStepUs       = micros();
+}
+
+/* =====================================================================
+ * COMPRESSION: End cycle (shared cleanup for normal + timeout)
+ * ===================================================================== */
+void endCompression(const char* reason) {
+  Serial.print("[COMP] === Cycle ended: ");
+  Serial.print(reason);
+  Serial.println(" ===");
+  disableSteppers();
+  compState      = COMP_IDLE;
+  stallCount     = 0;
+  lastCompressMs = millis();  // Reset auto-compress timer
 }
 
 /* =====================================================================
@@ -244,9 +268,8 @@ void handleCompression() {
 
   // --- Safety timeout ---
   if ((nowMs - compStartMs) >= COMPRESS_TIMEOUT_MS) {
-    Serial.println("[COMP] ⚠ SAFETY TIMEOUT — aborting cycle!");
-    disableSteppers();
-    compState = COMP_IDLE;
+    Serial.println("[COMP] ⚠ SAFETY TIMEOUT — aborting!");
+    endCompression("safety timeout");
     return;
   }
 
@@ -273,6 +296,7 @@ void handleCompression() {
       if (topDist >= PLATE_BOTTOM_CM) {
         Serial.println("[COMP] Plate at bottom limit");
         compState = COMP_MEASURE;
+        stallCount = 0;
         break;
       }
 
@@ -283,15 +307,21 @@ void handleCompression() {
         Serial.print(moved, 1);
         Serial.print("cm  dist=");
         Serial.print(topDist, 1);
-        Serial.println("cm");
+        Serial.print("cm  count=");
+        Serial.println(stallCount);
 
         if (moved < STALL_THRESHOLD_CM) {
-          Serial.println("[COMP] Stall detected — compression done");
-          compState = COMP_MEASURE;
+          stallCount++;
+          if (stallCount >= STALL_CONFIRM) {
+            Serial.println("[COMP] Stall CONFIRMED — compression done");
+            compState = COMP_MEASURE;
+          }
+          // Keep lastStallDist as-is so next check is also against last good position
         } else {
+          stallCount       = 0;   // Reset: plate is moving
           lastStallDist    = topDist;
-          lastStallCheckMs = nowMs;
         }
+        lastStallCheckMs = nowMs;
       }
       break;
     }
@@ -302,8 +332,8 @@ void handleCompression() {
       if (d > 0) topDist = d;
 
       // Calculate waste level:
-      //   Plate close to top (small topDist) → bin is FULL (waste pushed plate back up)
-      //   Plate far from top (large topDist) → bin is EMPTY (plate went all the way down)
+      //   Plate close to top (small topDist) → bin is FULL
+      //   Plate far from top (large topDist) → bin is EMPTY
       float pct = 100.0f * (1.0f - (topDist - PLATE_TOP_CM)
                                     / (PLATE_BOTTOM_CM - PLATE_TOP_CM));
       wasteLevel = constrain((int)pct, 0, 100);
@@ -325,10 +355,7 @@ void handleCompression() {
     case COMP_UP: {
       // Stop when plate reaches top resting position
       if (topDist <= PLATE_TOP_CM) {
-        Serial.println("[COMP] === Plate at top — cycle complete ===");
-        disableSteppers();
-        compState      = COMP_IDLE;
-        lastCompressMs = nowMs;
+        endCompression("plate at top");
       }
       break;
     }
@@ -338,7 +365,7 @@ void handleCompression() {
 }
 
 /* =====================================================================
- * LID: Proximity-based open/close (called every loop)
+ * LID: Proximity-based open/close with debounce (called every loop)
  * ===================================================================== */
 void handleLid() {
   unsigned long nowMs = millis();
@@ -351,6 +378,7 @@ void handleLid() {
       servoWrite(LID_CLOSED_ANGLE);
       lidOpen = false;
     }
+    proxCount = 0;
     return;
   }
 
@@ -358,17 +386,21 @@ void handleLid() {
   frontDist = (d > 0) ? d : 999.0f;
 
   if (frontDist <= PROXIMITY_CM) {
-    // Person detected
-    if (!lidOpen) {
-      Serial.print("[LID] Person at ");
+    // Person in range
+    proxCount++;
+    if (!lidOpen && proxCount >= PROX_DEBOUNCE) {
+      Serial.print("[LID] Person confirmed at ");
       Serial.print(frontDist, 1);
       Serial.println("cm — opening");
       servoWrite(LID_OPEN_ANGLE);
       lidOpen = true;
     }
-    lidLastSeenMs = nowMs;  // Reset hold timer
+    if (lidOpen) {
+      lidLastSeenMs = nowMs;  // Reset hold timer while person present
+    }
   } else {
-    // No person — close after hold delay
+    // No person
+    proxCount = 0;
     if (lidOpen && (nowMs - lidLastSeenMs) >= LID_HOLD_OPEN_MS) {
       Serial.println("[LID] No person — closing");
       servoWrite(LID_CLOSED_ANGLE);
@@ -522,7 +554,7 @@ void handleStatus() {
 
   // Compressor status (backward-compatible + new fields)
   bool isActive = (compState != COMP_IDLE);
-  doc["triggerActive"]      = isActive;           // Legacy field (dashboard/app)
+  doc["triggerActive"]      = isActive;           // Legacy field (v1 dashboard)
   doc["isCompressorActive"] = isActive;           // Flutter app field
 
   const char* stateStr = "idle";
@@ -613,7 +645,7 @@ void handleCompress() {
 void handleDeviceInfo() {
   StaticJsonDocument<256> doc;
   doc["deviceName"]      = "WESTO Smart Bin";
-  doc["firmwareVersion"] = "v2.0.0";
+  doc["firmwareVersion"] = "v2.1.0";
   doc["macAddress"]      = WiFi.softAPmacAddress();
   doc["ipAddress"]       = WiFi.softAPIP().toString();
   doc["mode"]            = "AP + STA";
@@ -635,7 +667,7 @@ void handleRoot() {
 void printBanner() {
   Serial.println();
   Serial.println("╔════════════════════════════════════════════╗");
-  Serial.println("║    WESTO SMART BIN v2.0 — DASHBOARD       ║");
+  Serial.println("║    WESTO SMART BIN v2.1 — DASHBOARD       ║");
   Serial.println("╠════════════════════════════════════════════╣");
   Serial.print("║  AP:  http://");
   Serial.print(WiFi.softAPIP());
@@ -666,7 +698,7 @@ void printBanner() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n========== WESTO ESP32 v2.0 BOOTING ==========");
+  Serial.println("\n\n========== WESTO ESP32 v2.1 BOOTING ==========");
 
   // --- Pin modes ---
   pinMode(LED_PIN, OUTPUT);
@@ -678,28 +710,34 @@ void setup() {
   pinMode(TOP_TRIG_PIN, OUTPUT);
   pinMode(TOP_ECHO_PIN, INPUT);
 
-  // Stepper pins
+  // Stepper pins (set SLEEP LOW first to prevent boot-pulse movement)
+  pinMode(STEPPER1_SLP, OUTPUT);
+  digitalWrite(STEPPER1_SLP, LOW);
+  pinMode(STEPPER2_SLP, OUTPUT);
+  digitalWrite(STEPPER2_SLP, LOW);
+
   pinMode(STEPPER1_STEP, OUTPUT);
   pinMode(STEPPER1_DIR, OUTPUT);
-  pinMode(STEPPER1_SLP, OUTPUT);
   pinMode(STEPPER2_STEP, OUTPUT);
   pinMode(STEPPER2_DIR, OUTPUT);
-  pinMode(STEPPER2_SLP, OUTPUT);
 
-  // Start with steppers disabled (sleep mode = low power)
-  disableSteppers();
   digitalWrite(STEPPER1_STEP, LOW);
   digitalWrite(STEPPER2_STEP, LOW);
   digitalWrite(STEPPER1_DIR, LOW);
   digitalWrite(STEPPER2_DIR, LOW);
 
+  Serial.println("[STEPPER] Drivers in sleep mode (init)");
+
   // --- Servo (LEDC PWM) ---
+  // For ESP32 Arduino Core 3.x, replace these two lines with:
+  //   ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_BITS);
   ledcSetup(SERVO_CHANNEL, SERVO_FREQ, SERVO_BITS);
   ledcAttachPin(SERVO_PIN, SERVO_CHANNEL);
   servoWrite(LID_CLOSED_ANGLE);
   Serial.println("[SERVO] Lid closed (init)");
 
   // --- Initial sensor reading ---
+  delay(100);  // Let sensors settle
   float d = readUltrasonic(TOP_TRIG_PIN, TOP_ECHO_PIN);
   topDist = (d > 0) ? d : PLATE_TOP_CM;
   Serial.print("[SENSOR] Initial plate distance: ");
