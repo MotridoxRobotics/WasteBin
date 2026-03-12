@@ -48,12 +48,18 @@
 // Lid Servo Motor
 #define SERVO_PIN        4
 
-// Stepper Motor 1 (A4988: STEP, DIR, SLEEP)
+// Stepper Motor 1 — A4988 Driver
+//   STEP → GPIO 25    DIR → GPIO 26    SLEEP → GPIO 27
+//   RESET → jumper to SLEEP (physical wire on board!)
+//   MS1/MS2/MS3 → leave unconnected (internal pull-down = full-step)
 #define STEPPER1_STEP    25
 #define STEPPER1_DIR     26
 #define STEPPER1_SLP     27
 
-// Stepper Motor 2 (A4988: STEP, DIR, SLEEP)
+// Stepper Motor 2 — A4988 Driver
+//   STEP → GPIO 32    DIR → GPIO 33    SLEEP → GPIO 14
+//   RESET → jumper to SLEEP (physical wire on board!)
+//   MS1/MS2/MS3 → leave unconnected (internal pull-down = full-step)
 #define STEPPER2_STEP    32
 #define STEPPER2_DIR     33
 #define STEPPER2_SLP     14    // NOTE: GPIO14 may pulse HIGH briefly at boot
@@ -188,7 +194,16 @@ void servoWrite(int angle) {
 
 /* =====================================================================
  * STEPPERS: Low-level A4988 control (no library needed)
- * A4988 MS1/MS2/MS3 left unconnected = full-step mode (internal pull-down)
+ * A4988 wiring (per driver):
+ *   STEP → ESP32 GPIO (pulse = one step)
+ *   DIR  → ESP32 GPIO (direction control)
+ *   SLEEP → ESP32 GPIO (LOW = sleep, HIGH = active)
+ *   RESET → jumper wire to SLEEP pin on the SAME board!
+ *           (RESET is active-LOW with no pull-up — floating = random resets)
+ *   MS1/MS2/MS3 → leave unconnected (internal pull-down = full-step mode)
+ *   VMOT → motor supply (8-35V)    VDD → 3.3V from ESP32
+ *   GND  → common ground (ESP32 + motor supply)
+ *   1A/1B/2A/2B → stepper coil wires
  * ===================================================================== */
 void enableSteppers() {
   digitalWrite(STEPPER1_SLP, HIGH);
