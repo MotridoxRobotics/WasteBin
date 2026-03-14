@@ -3,7 +3,7 @@
 #include <ArduinoJson.h>
 
 /* =====================================================================
- * WESTO Smart Waste Bin — ESP32 Firmware v2.1.0
+ * WESTO Smart Waste Bin — ESP32 Firmware v2.2.0
  * =====================================================================
  * Hardware:
  *   - ESP32 DevKit
@@ -29,6 +29,7 @@
  * Changelog:
  *   v1.1.0 — Original (Irfan): WiFi AP, dashboard, LED blink on compress
  *   v2.0.0 — Jarvis: Full hardware control, state machine, sensors, servo
+ *   v2.2.0 — Jarvis: 1/16 microstepping (shared MS pins), step speed adjusted
  *   v2.1.0 — Jarvis: Stall debounce, proximity debounce, timeout fix
  * ===================================================================== */
 
@@ -51,7 +52,6 @@
 // Stepper Motor 1 — A4988 Driver
 //   STEP → GPIO 25    DIR → GPIO 26    SLEEP → GPIO 27
 //   RESET → jumper to SLEEP (physical wire on board!)
-//   MS1/MS2/MS3 → leave unconnected (internal pull-down = full-step)
 #define STEPPER1_STEP    25
 #define STEPPER1_DIR     26
 #define STEPPER1_SLP     27
@@ -59,10 +59,17 @@
 // Stepper Motor 2 — A4988 Driver
 //   STEP → GPIO 32    DIR → GPIO 33    SLEEP → GPIO 14
 //   RESET → jumper to SLEEP (physical wire on board!)
-//   MS1/MS2/MS3 → leave unconnected (internal pull-down = full-step)
 #define STEPPER2_STEP    32
 #define STEPPER2_DIR     33
 #define STEPPER2_SLP     14    // NOTE: GPIO14 may pulse HIGH briefly at boot
+
+// A4988 Microstepping Pins (SHARED between both drivers!)
+//   Both drivers' MS1 → GPIO 16, MS2 → GPIO 17, MS3 → GPIO 5
+//   All HIGH = 1/16 microstepping (smoothest, best torque at low-mid RPM)
+//   MS truth table: L/L/L=full, H/L/L=half, L/H/L=1/4, H/H/L=1/8, H/H/H=1/16
+#define MS1_PIN          16
+#define MS2_PIN          17
+#define MS3_PIN          5
 
 // Built-in LED (status indicator)
 #define LED_PIN          2
@@ -101,7 +108,9 @@
 #define STALL_CHECK_MS       5000UL   // Check for stall every 5 seconds
 #define STALL_THRESHOLD_CM   1.0f     // Plate moved < this in stall period → stalled
 #define STALL_CONFIRM        2        // Require N consecutive stall checks to confirm
-#define STEP_INTERVAL_US     3000UL   // Microseconds between step pulses (~100 RPM at 200 spr)
+#define STEP_INTERVAL_US     500UL    // Microseconds between step pulses (~37 RPM at 3200 µsteps/rev)
+                                        // 1/16 microstep: 3200 µsteps/rev → 500µs ≈ 37 RPM
+                                        // Was 3000µs for full-step (200 spr), now faster for µstep
 
 // --- Stepper direction (swap HIGH/LOW if plate moves the wrong way) ---
 #define DIR_DOWN             HIGH     // A4988 DIR pin state to move plate DOWN
@@ -195,12 +204,13 @@ void servoWrite(int angle) {
 /* =====================================================================
  * STEPPERS: Low-level A4988 control (no library needed)
  * A4988 wiring (per driver):
- *   STEP → ESP32 GPIO (pulse = one step)
+ *   STEP → ESP32 GPIO (pulse = one microstep)
  *   DIR  → ESP32 GPIO (direction control)
  *   SLEEP → ESP32 GPIO (LOW = sleep, HIGH = active)
  *   RESET → jumper wire to SLEEP pin on the SAME board!
  *           (RESET is active-LOW with no pull-up — floating = random resets)
- *   MS1/MS2/MS3 → leave unconnected (internal pull-down = full-step mode)
+ *   MS1 → GPIO 16 (shared)  MS2 → GPIO 17 (shared)  MS3 → GPIO 5 (shared)
+ *   All HIGH = 1/16 microstepping (smoother, better torque at low-mid RPM)
  *   VMOT → motor supply (8-35V)    VDD → 3.3V from ESP32
  *   GND  → common ground (ESP32 + motor supply)
  *   1A/1B/2A/2B → stepper coil wires
@@ -660,7 +670,7 @@ void handleCompress() {
 void handleDeviceInfo() {
   StaticJsonDocument<256> doc;
   doc["deviceName"]      = "WESTO Smart Bin";
-  doc["firmwareVersion"] = "v2.1.0";
+  doc["firmwareVersion"] = "v2.2.0";
   doc["macAddress"]      = WiFi.softAPmacAddress();
   doc["ipAddress"]       = WiFi.softAPIP().toString();
   doc["mode"]            = "AP + STA";
@@ -741,7 +751,16 @@ void setup() {
   digitalWrite(STEPPER1_DIR, LOW);
   digitalWrite(STEPPER2_DIR, LOW);
 
-  Serial.println("[STEPPER] Drivers in sleep mode (init)");
+  // Microstepping: MS1+MS2+MS3 all HIGH = 1/16 step mode
+  // Both drivers share these pins — wire both MS1→GPIO16, MS2→GPIO17, MS3→GPIO5
+  pinMode(MS1_PIN, OUTPUT);
+  pinMode(MS2_PIN, OUTPUT);
+  pinMode(MS3_PIN, OUTPUT);
+  digitalWrite(MS1_PIN, HIGH);
+  digitalWrite(MS2_PIN, HIGH);
+  digitalWrite(MS3_PIN, HIGH);
+
+  Serial.println("[STEPPER] Drivers in sleep mode (init), 1/16 microstepping set");
 
   // --- Servo (LEDC PWM) ---
   // For ESP32 Arduino Core 3.x, replace these two lines with:

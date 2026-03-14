@@ -36,7 +36,9 @@ A Smart Waste Bin with built-in waste compression mechanism.
 | DIR | GPIO 26 |
 | SLEEP | GPIO 27 |
 | RESET | **Jumper to SLEEP** ⚠️ |
-| MS1/MS2/MS3 | Leave unconnected |
+| MS1 | GPIO 16 (shared) |
+| MS2 | GPIO 17 (shared) |
+| MS3 | GPIO 5 (shared) |
 | VDD | 3.3V |
 | GND | Common GND |
 | VMOT | 8-35V motor supply |
@@ -49,7 +51,9 @@ A Smart Waste Bin with built-in waste compression mechanism.
 | DIR | GPIO 33 |
 | SLEEP | GPIO 14 |
 | RESET | **Jumper to SLEEP** ⚠️ |
-| MS1/MS2/MS3 | Leave unconnected |
+| MS1 | GPIO 16 (shared) |
+| MS2 | GPIO 17 (shared) |
+| MS3 | GPIO 5 (shared) |
 | VDD | 3.3V |
 | GND | Common GND |
 | VMOT | 8-35V motor supply |
@@ -64,7 +68,7 @@ A Smart Waste Bin with built-in waste compression mechanism.
 
 ### ⚠️ Important
 - **RESET↔SLEEP jumper is mandatory** on each A4988 — solder or wire a bridge between these two pins on the board. RESET has no internal pull-up; leaving it floating causes erratic behavior.
-- **MS1/MS2/MS3** have internal pull-downs → unconnected = full-step mode (max torque).
+- **MS1/MS2/MS3 are shared** between both drivers — wire each MS pin from the ESP32 to BOTH A4988 boards. All set HIGH = 1/16 microstepping (best torque and smoothness).
 - **100µF capacitor** across VMOT–GND on each A4988 is recommended.
 - **All GNDs must be connected** (ESP32 + motor supply + A4988).
 
@@ -90,6 +94,7 @@ After wiring, update these `#define` values in `WasteBin.ino`:
 
 | Version | Changes |
 |---------|---------|
+| v2.2.0 | 1/16 microstepping: shared MS1/MS2/MS3 pins, speed adjustment |
 | v2.1.0 | Stall debounce, proximity debounce, boot safety, timeout fix |
 | v2.0.0 | Full hardware: steppers, ultrasonics, servo, state machine |
 | v1.1.0 | WiFi AP, dashboard, LED blink on compress trigger |
