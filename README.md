@@ -9,7 +9,7 @@ A Smart Waste Bin with built-in waste compression mechanism.
 - Dual stepper compression plate with stall detection
 - Ultrasonic waste level measurement
 - Wi-Fi AP + STA with web dashboard
-- REST API for Flutter companion app ([Westo](https://github.com/IrfanFathan/westo))
+- REST API for Flutter companion app ([Westo](https://github.com/MotridoxRobotics/westo))
 
 ## Wiring
 
